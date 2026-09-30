@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use kline_ecu_sim::{
-    EchoGuard, EcuProfile, EcuSimulator, EcuState, NativeSerialPort, SilencePacketizer,
+    CarLed, EchoGuard, EcuProfile, EcuSimulator, EcuState, NativeSerialPort, SilencePacketizer,
     SlowInitDetector,
 };
 
@@ -59,6 +59,10 @@ struct Args {
     /// Vehicle Identification Number (VIN)
     #[arg(long, default_value = "9BWCA05X12P123456")]
     vin: String,
+
+    /// GPIO line for Car-side TX activity LED (default: 10 on gpiochip0 / PA10)
+    #[arg(long, default_value_t = 10)]
+    car_led_line: u32,
 }
 
 #[tokio::main]
@@ -160,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut packetizer = SilencePacketizer::new(args.baud, 15.0);
     let mut echo_guard = EchoGuard::new(args.baud);
+    let mut car_led = CarLed::open(Some(args.car_led_line));
     let mut slow_init = SlowInitDetector::new();
     let mut wake_deadline: Option<TokioInstant> = None;
     let mut kb2_deadline: Option<TokioInstant> = None;
@@ -167,6 +172,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Main Event Loop
     loop {
+        car_led.service();
+
         let timeout_fut = async {
             if let Some(duration) = packetizer.time_until_silence() {
                 sleep(duration).await;
@@ -215,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // When a complete frame arrives, cancel any pending slow-init wake
                         wake_deadline = None;
                         slow_init.reset();
-                        handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &frame, &shared_rpm);
+                        handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &mut car_led, &frame, &shared_rpm);
                         if ecu.state == EcuState::SessionActive {
                             kb2_deadline = None;
                         }
@@ -229,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let resp = vec![0x55, ecu.kb1, ecu.kb2];
                     info!("⚡ [HANDSHAKE] Wake 5-baud -> TX {:02X?}", resp);
                     echo_guard.record_tx(&resp);
+                    car_led.pulse();
                     if let Err(e) = serial_writer.write_all(&resp) {
                         error!("Serial write error: {}", e);
                     }
@@ -249,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             _ = timeout_fut => {
                 if let Some(frame) = packetizer.check_timeout() {
-                    handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &frame, &shared_rpm);
+                    handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &mut car_led, &frame, &shared_rpm);
                     if ecu.state == EcuState::SessionActive {
                         kb2_deadline = None;
                     }
@@ -278,6 +286,7 @@ fn handle_frame(
     ecu: &mut EcuSimulator,
     serial_writer: &mut NativeSerialPort,
     echo_guard: &mut EchoGuard,
+    car_led: &mut CarLed,
     frame: &[u8],
     shared_rpm: &Arc<AtomicU16>,
 ) {
@@ -298,6 +307,7 @@ fn handle_frame(
         if !resp.is_empty() {
             info!("⚡ [HANDSHAKE] RX 0x{:02X} -> TX {:02X?}", incoming_byte, resp);
             echo_guard.record_tx(&resp);
+            car_led.pulse();
             if let Err(e) = serial_writer.write_all(&resp) {
                 error!("Serial write error: {}", e);
             }
@@ -310,6 +320,7 @@ fn handle_frame(
     if let Some(resp) = ecu.process_frame(frame) {
         log_diagnostic_exchange(frame, &resp, ecu.data.rpm);
         echo_guard.record_tx(&resp);
+        car_led.pulse();
         if let Err(e) = serial_writer.write_all(&resp) {
             error!("Serial write error: {}", e);
         }
