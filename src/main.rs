@@ -60,8 +60,8 @@ struct Args {
     #[arg(long, default_value = "9BWCA05X12P123456")]
     vin: String,
 
-    /// GPIO line for Car-side TX activity LED (default: 10 on gpiochip0 / PA10)
-    #[arg(long, default_value_t = 10)]
+    /// GPIO line for Car-side TX activity LED (default: 0 on gpiochip0 / PA0 / Pin 13)
+    #[arg(long, default_value_t = 0)]
     car_led_line: u32,
 }
 
@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut packetizer = SilencePacketizer::new(args.baud, 15.0);
+    let mut packetizer = SilencePacketizer::new(args.baud, 30.0);
     let mut echo_guard = EchoGuard::new(args.baud);
     let mut car_led = CarLed::open(Some(args.car_led_line));
     let mut slow_init = SlowInitDetector::new();

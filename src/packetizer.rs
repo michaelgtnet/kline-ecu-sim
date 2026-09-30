@@ -52,9 +52,42 @@ impl SilencePacketizer {
         }
     }
 
+    pub fn is_partial_known_frame(&self) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+        let fmt = self.buffer[0];
+        // Valid KWP2000 format bytes sent by testers: 0x80 or 0xC1..0xCE
+        if fmt == 0x80 || (fmt >= 0xC1 && fmt <= 0xCE) {
+            let len_in_fmt = (fmt & 0x3F) as usize;
+            let total_len = if len_in_fmt > 0 {
+                3 + len_in_fmt + 1
+            } else if self.buffer.len() >= 4 {
+                4 + (self.buffer[3] as usize) + 1
+            } else {
+                5
+            };
+            return self.buffer.len() < total_len;
+        }
+        // ISO 9141-2 request header
+        if (fmt == 0x68 || fmt == 0x48) && self.buffer.len() < 5 {
+            return true;
+        }
+        false
+    }
+
+    pub fn current_threshold(&self) -> Duration {
+        if self.is_partial_known_frame() {
+            Duration::from_millis(60) // Allow up to 60ms for scanner to transmit rest of frame
+        } else {
+            self.silence_threshold
+        }
+    }
+
     pub fn check_timeout(&mut self) -> Option<Vec<u8>> {
         if let Some(last_rx) = self.last_rx_time {
-            if Instant::now().duration_since(last_rx) >= self.silence_threshold && !self.buffer.is_empty() {
+            let threshold = self.current_threshold();
+            if Instant::now().duration_since(last_rx) >= threshold && !self.buffer.is_empty() {
                 return Some(self.flush());
             }
         }
@@ -67,11 +100,12 @@ impl SilencePacketizer {
             return None;
         }
 
+        let threshold = self.current_threshold();
         let elapsed = Instant::now().saturating_duration_since(last_rx);
-        if elapsed >= self.silence_threshold {
+        if elapsed >= threshold {
             Some(Duration::ZERO)
         } else {
-            Some(self.silence_threshold - elapsed)
+            Some(threshold - elapsed)
         }
     }
 

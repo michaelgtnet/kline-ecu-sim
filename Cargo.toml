@@ -18,6 +18,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gpio-cdev = "0.6"
+
 [dev-dependencies]
 tokio-test = "0.4"
 
