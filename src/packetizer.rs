@@ -1,4 +1,4 @@
-//! Dynamic silence-based packetizer for ISO 9141 and ISO 14230 frames.
+//! Dynamic silence and length-aware packetizer for ISO 9141 and ISO 14230 frames.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ pub struct SilencePacketizer {
 impl SilencePacketizer {
     pub fn new(baud: u32, base_silence_ms: f32) -> Self {
         let byte_time_us = 10_000_000u64.div_ceil(baud as u64);
-        let min_silence_us = (byte_time_us as f64 * 1.8) as u64;
+        let min_silence_us = (byte_time_us as f64 * 2.0) as u64;
         let config_silence_us = (base_silence_ms * 1000.0) as u64;
         let chosen_silence_us = config_silence_us.max(min_silence_us);
 
@@ -32,6 +32,18 @@ impl SilencePacketizer {
 
         self.last_rx_time = Some(Instant::now());
         self.buffer.extend_from_slice(bytes);
+
+        // Strip leading 0x00 (fast-init break pulses) if followed by real frame bytes
+        while self.buffer.len() > 1 && self.buffer[0] == 0x00 {
+            self.buffer.remove(0);
+        }
+
+        // Check if buffer contains a complete, verified ISO frame right now
+        if let Some(frame_len) = Self::detect_complete_frame(&self.buffer) {
+            self.last_rx_time = None;
+            let frame: Vec<u8> = self.buffer.drain(..frame_len).collect();
+            return Some(frame);
+        }
 
         if self.buffer.len() >= self.max_chunk_size {
             Some(self.flush())
@@ -71,6 +83,59 @@ impl SilencePacketizer {
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
+
+    /// Inspect buffer to see if a complete, valid ISO frame is already present.
+    fn detect_complete_frame(buf: &[u8]) -> Option<usize> {
+        if buf.is_empty() {
+            return None;
+        }
+
+        let fmt = buf[0];
+
+        // 1. ISO 14230 (KWP2000) with addressing (bits 7..6 != 0)
+        if (fmt & 0xC0) != 0 {
+            let len_in_fmt = (fmt & 0x3F) as usize;
+            if len_in_fmt > 0 {
+                // Header: [fmt, target, source] (3 bytes) + data (len_in_fmt) + checksum (1 byte)
+                let total_len = 3 + len_in_fmt + 1;
+                if buf.len() >= total_len {
+                    let expected_csum = buf[..total_len - 1]
+                        .iter()
+                        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+                    if expected_csum == buf[total_len - 1] {
+                        return Some(total_len);
+                    }
+                }
+            } else {
+                // fmt & 0x3F == 0 (e.g. 0x80):
+                // Header: [fmt, target, source, len_byte] (4 bytes) + data (len_byte) + checksum (1 byte)
+                if buf.len() >= 4 {
+                    let len_byte = buf[3] as usize;
+                    let total_len = 4 + len_byte + 1;
+                    if buf.len() >= total_len {
+                        let expected_csum = buf[..total_len - 1]
+                            .iter()
+                            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+                        if expected_csum == buf[total_len - 1] {
+                            return Some(total_len);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. ISO 9141-2 / SAE J1979 request headers (0x68, 0x48)
+        if (fmt == 0x68 || fmt == 0x48) && buf.len() >= 5 {
+            let expected_csum = buf[..buf.len() - 1]
+                .iter()
+                .fold(0u8, |acc, &b| acc.wrapping_add(b));
+            if expected_csum == buf[buf.len() - 1] {
+                return Some(buf.len());
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -79,9 +144,31 @@ mod tests {
 
     #[test]
     fn test_packetizer_flush() {
-        let mut p = SilencePacketizer::new(10400, 1.8);
+        let mut p = SilencePacketizer::new(10400, 15.0);
         p.push(&[0x01, 0x02, 0x03]);
         assert_eq!(p.flush(), vec![0x01, 0x02, 0x03]);
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_fast_init_byte_by_byte_assembly() {
+        let mut p = SilencePacketizer::new(10400, 15.0);
+        // Fast init [C1, 33, F1, 81, 66] pushed one byte at a time
+        assert_eq!(p.push(&[0xC1]), None);
+        assert_eq!(p.push(&[0x33]), None);
+        assert_eq!(p.push(&[0xF1]), None);
+        assert_eq!(p.push(&[0x81]), None);
+        assert_eq!(p.push(&[0x66]), Some(vec![0xC1, 0x33, 0xF1, 0x81, 0x66]));
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_fast_init_with_leading_break() {
+        let mut p = SilencePacketizer::new(10400, 15.0);
+        // Break pulse 0x00 arrives first, then fast init bytes
+        assert_eq!(p.push(&[0x00]), None);
+        assert_eq!(p.push(&[0xC1, 0x33]), None);
+        assert_eq!(p.push(&[0xF1, 0x81, 0x66]), Some(vec![0xC1, 0x33, 0xF1, 0x81, 0x66]));
         assert!(p.is_empty());
     }
 }

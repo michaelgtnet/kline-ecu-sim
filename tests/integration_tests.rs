@@ -89,3 +89,37 @@ fn test_echoguard_filtering() {
     let filtered = echo.filter_rx(&incoming);
     assert_eq!(filtered, vec![0xF7]);
 }
+
+#[test]
+fn test_thinkdiag_fast_init_end_to_end() {
+    use kline_ecu_sim::SilencePacketizer;
+
+    let mut packetizer = SilencePacketizer::new(10400, 15.0);
+    let mut ecu = EcuSimulator::new(EcuProfile::BoschMe75);
+
+    // 1. ThinkDiag sends 25ms break pulse (0x00)
+    let f1 = packetizer.push(&[0x00]);
+    assert_eq!(f1, None);
+
+    // 2. ThinkDiag sends C1, 33, F1, 81, 66 (with 5-6ms inter-byte gaps, pushed chunk by chunk)
+    assert_eq!(packetizer.push(&[0xC1]), None);
+    assert_eq!(packetizer.push(&[0x33]), None);
+    assert_eq!(packetizer.push(&[0xF1]), None);
+    assert_eq!(packetizer.push(&[0x81]), None);
+    let frame = packetizer.push(&[0x66]).expect("Expected complete Fast Init frame");
+
+    assert_eq!(frame, vec![0xC1, 0x33, 0xF1, 0x81, 0x66]);
+
+    // 3. Process frame with ECU simulator
+    let resp = ecu.process_frame(&frame).expect("Expected Fast Init response");
+    // Should be positive response: [0x83, 0xF1, 0x11, 0xC1, 0x08, 0x08, CS]
+    assert_eq!(resp[0], 0x83);
+    assert_eq!(resp[1], 0xF1); // Target = Tester
+    assert_eq!(resp[2], 0x11); // Source = ECU (Bosch ME 7.5 engine)
+    assert_eq!(resp[3], 0xC1); // Positive response to $81
+    assert_eq!(resp[4], 0x08); // KB1
+    assert_eq!(resp[5], 0x08); // KB2
+    assert_eq!(resp[6], 0x56); // Checksum: 0x83+0xF1+0x11+0xC1+0x08+0x08 = 598 (0x256) & 0xFF = 0x56
+    assert_eq!(ecu.state, EcuState::SessionActive);
+}
+

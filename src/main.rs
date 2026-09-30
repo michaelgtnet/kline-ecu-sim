@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut packetizer = SilencePacketizer::new(args.baud, 1.8);
+    let mut packetizer = SilencePacketizer::new(args.baud, 15.0);
     let mut echo_guard = EchoGuard::new(args.baud);
     let mut last_session_state = ecu.state;
 

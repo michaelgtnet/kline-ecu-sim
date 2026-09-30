@@ -42,6 +42,13 @@ pub enum EcuState {
     SessionActive,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DiagnosticProtocol {
+    Iso14230,
+    Iso9141,
+    VagKwp1281,
+}
+
 #[derive(Debug, Clone)]
 pub struct DiagnosticData {
     pub rpm: u16,
@@ -68,6 +75,7 @@ impl Default for DiagnosticData {
 pub struct EcuSimulator {
     pub profile: EcuProfile,
     pub state: EcuState,
+    pub protocol: DiagnosticProtocol,
     pub data: DiagnosticData,
     pub address: u8,
     pub kb1: u8,
@@ -87,13 +95,14 @@ impl EcuSimulator {
         let (address, kb1, kb2, ecu_addr, tester_addr) = match profile {
             EcuProfile::BoschMe75 => (0x01, 0x08, 0x08, 0x11, 0xF1), // Engine 0x01, KB 0x08 0x08, ECU 0x11
             EcuProfile::VagKwp1281 => (0x01, 0x01, 0x8A, 0x01, 0xF1), // VAG 0x01, KB 0x01 0x8A
-            EcuProfile::GenericObd => (0x33, 0x08, 0x08, 0x33, 0xF1), // OBD-II 0x33, KB 0x08 0x08
-            EcuProfile::MarelliIaw => (0x01, 0x8F, 0x6D, 0x10, 0xF1), // Fiat/Marelli 0x01, KB 0x8F 0x6D
+            EcuProfile::GenericObd => (0x33, 0x08, 0x08, 0x11, 0xF1), // OBD-II 0x33, KB 0x08 0x08, ECU 0x11
+            EcuProfile::MarelliIaw => (0x01, 0x8F, 0x6D, 0x10, 0xF1), // Fiat/Marelli 0x01, KB 0x8F 0x6D, ECU 0x10
         };
 
         Self {
             profile,
             state: EcuState::Idle,
+            protocol: DiagnosticProtocol::Iso14230,
             data: DiagnosticData::default(),
             address,
             kb1,
@@ -107,7 +116,7 @@ impl EcuSimulator {
     pub fn process_byte(&mut self, byte: u8) -> Vec<u8> {
         match self.state {
             EcuState::Idle => {
-                if byte == self.address || (self.profile == EcuProfile::GenericObd && byte == 0x33) {
+                if byte == self.address || byte == 0x33 || byte == 0x01 {
                     self.state = EcuState::SyncSent;
                     vec![0x55, self.kb1, self.kb2]
                 } else {
@@ -119,8 +128,10 @@ impl EcuSimulator {
                 if byte == expected_inv_kb2 {
                     self.state = EcuState::SessionActive;
                     if self.profile == EcuProfile::VagKwp1281 {
+                        self.protocol = DiagnosticProtocol::VagKwp1281;
                         Vec::new()
                     } else {
+                        self.protocol = DiagnosticProtocol::Iso9141;
                         vec![!self.address]
                     }
                 } else {
@@ -221,8 +232,9 @@ impl EcuSimulator {
         if frame.len() >= 4 && frame[frame.len() - 2] == 0x81 {
             let target = if frame.len() >= 5 { frame[1] } else { self.address };
             let source = if frame.len() >= 5 { frame[2] } else { self.tester_addr };
-            if target == self.address || target == 0x33 || target == 0x11 || target == 0x01 {
+            if target == self.address || target == 0x33 || target == 0x11 || target == 0x01 || target == 0x10 {
                 self.tester_addr = source;
+                self.protocol = DiagnosticProtocol::Iso14230;
                 let mut resp = vec![0x83, self.tester_addr, self.ecu_addr, 0xC1, self.kb1, self.kb2];
                 resp.push(Self::calc_checksum(&resp));
                 return Some(resp);
@@ -231,27 +243,52 @@ impl EcuSimulator {
         None
     }
 
-    fn parse_iso_service<'a>(&self, frame: &'a [u8]) -> Option<(u8, &'a [u8])> {
-        let payload_without_csum = &frame[..frame.len() - 1];
-        if payload_without_csum.is_empty() {
+    fn parse_iso_service<'a>(&mut self, frame: &'a [u8]) -> Option<(u8, &'a [u8])> {
+        let payload = &frame[..frame.len() - 1]; // strip checksum
+        if payload.is_empty() {
             return None;
         }
 
-        // Standard 3-byte physical/functional header: [Fmt, Target, Source, Service, ...]
-        if (payload_without_csum[0] & 0xC0) != 0 || payload_without_csum[0] == 0x68 {
-            if payload_without_csum.len() >= 4 {
-                let service = payload_without_csum[3];
-                let sub = &payload_without_csum[4..];
-                Some((service, sub))
-            } else {
-                None
+        let fmt = payload[0];
+
+        // ISO 9141-2 / SAE J1979 request headers (0x68, 0x48)
+        if fmt == 0x68 || fmt == 0x48 {
+            if payload.len() >= 4 {
+                self.tester_addr = payload[2];
+                let service = payload[3];
+                let sub = &payload[4..];
+                return Some((service, sub));
             }
-        } else {
-            // Raw service byte
-            let service = payload_without_csum[0];
-            let sub = &payload_without_csum[1..];
-            Some((service, sub))
+            return None;
         }
+
+        // ISO 14230 (KWP2000)
+        if (fmt & 0xC0) != 0 {
+            let len_in_fmt = (fmt & 0x3F) as usize;
+            if len_in_fmt > 0 {
+                // Header is [fmt, target, source] (3 bytes)
+                if payload.len() >= 4 {
+                    self.tester_addr = payload[2];
+                    let service = payload[3];
+                    let sub = &payload[4..];
+                    return Some((service, sub));
+                }
+            } else {
+                // fmt & 0x3F == 0 (e.g. 0x80): Header is [fmt, target, source, len] (4 bytes)
+                if payload.len() >= 5 {
+                    self.tester_addr = payload[2];
+                    let service = payload[4];
+                    let sub = &payload[5..];
+                    return Some((service, sub));
+                }
+            }
+            return None;
+        }
+
+        // Raw / single-byte or non-addressed
+        let service = payload[0];
+        let sub = &payload[1..];
+        Some((service, sub))
     }
 
     fn handle_mode_01(&self, pid: u8) -> Vec<u8> {
@@ -306,10 +343,20 @@ impl EcuSimulator {
     }
 
     fn wrap_iso_response(&self, resp_service: u8, payload: &[u8]) -> Vec<u8> {
-        let len = (payload.len() + 1) as u8;
-        let fmt = 0x80 | (len & 0x3F);
-        let mut msg = vec![fmt, self.tester_addr, self.ecu_addr, resp_service];
-        msg.extend_from_slice(payload);
+        let mut msg = match self.protocol {
+            DiagnosticProtocol::Iso9141 => {
+                let mut m = vec![0x48, 0x6B, self.ecu_addr, resp_service];
+                m.extend_from_slice(payload);
+                m
+            }
+            DiagnosticProtocol::Iso14230 | DiagnosticProtocol::VagKwp1281 => {
+                let len = (payload.len() + 1) as u8;
+                let fmt = 0x80 | (len & 0x3F);
+                let mut m = vec![fmt, self.tester_addr, self.ecu_addr, resp_service];
+                m.extend_from_slice(payload);
+                m
+            }
+        };
         msg.push(Self::calc_checksum(&msg));
         msg
     }

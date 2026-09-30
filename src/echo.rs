@@ -21,7 +21,7 @@ impl EchoGuard {
     pub fn record_tx(&mut self, data: &[u8]) {
         self.tx_in_flight.extend_from_slice(data);
         let byte_us = 10_000_000u64.div_ceil(self.baud_rate as u64);
-        let total_us = (data.len() as u64) * byte_us + 2000; // tx duration + 2ms margin
+        let total_us = (data.len() as u64) * byte_us + 30_000; // tx duration + 30ms margin for OS thread jitter
         self.window_deadline = Some(Instant::now() + Duration::from_micros(total_us));
     }
 
