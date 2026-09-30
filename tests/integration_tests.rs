@@ -115,11 +115,11 @@ fn test_thinkdiag_fast_init_end_to_end() {
     // Should be positive response: [0x83, 0xF1, 0x11, 0xC1, 0x08, 0x08, CS]
     assert_eq!(resp[0], 0x83);
     assert_eq!(resp[1], 0xF1); // Target = Tester
-    assert_eq!(resp[2], 0x11); // Source = ECU (Bosch ME 7.5 engine)
+    assert_eq!(resp[2], 0x10); // Source = ECU (ISO 14230-4 CARB OBD-II Engine physical address 0x10)
     assert_eq!(resp[3], 0xC1); // Positive response to $81
     assert_eq!(resp[4], 0x08); // KB1
     assert_eq!(resp[5], 0x08); // KB2
-    assert_eq!(resp[6], 0x56); // Checksum: 0x83+0xF1+0x11+0xC1+0x08+0x08 = 598 (0x256) & 0xFF = 0x56
+    assert_eq!(resp[6], 0x55); // Checksum: 0x83+0xF1+0x10+0xC1+0x08+0x08 = 597 (0x255) & 0xFF = 0x55
     assert_eq!(ecu.state, EcuState::SessionActive);
 }
 
