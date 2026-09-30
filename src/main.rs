@@ -176,19 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(raw_bytes) = rx.recv() => {
                 let legitimate = echo_guard.filter_rx(&raw_bytes);
                 if !legitimate.is_empty() {
-                    // Check if in 5-baud wait mode and a single byte arrives
-                    if (ecu.state == EcuState::Idle || ecu.state == EcuState::SyncSent) && legitimate.len() == 1 {
-                        let incoming_byte = legitimate[0];
-                        let resp = ecu.process_byte(incoming_byte);
-                        if !resp.is_empty() {
-                            info!("⚡ [HANDSHAKE] RX 0x{:02X} -> TX {:02X?}", incoming_byte, resp);
-                            echo_guard.record_tx(&resp);
-                            if let Err(e) = serial_writer.write_all(&resp) {
-                                error!("Serial write error: {}", e);
-                            }
-                            let _ = serial_writer.flush();
-                        }
-                    } else if let Some(frame) = packetizer.push(&legitimate) {
+                    info!("📥 [BUS RX] {} bytes: {:02X?}", legitimate.len(), legitimate);
+                    if let Some(frame) = packetizer.push(&legitimate) {
                         handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &frame, &shared_rpm);
                     }
                 }
@@ -219,8 +208,28 @@ fn handle_frame(
     frame: &[u8],
     shared_rpm: &Arc<AtomicU16>,
 ) {
+    if frame.is_empty() {
+        return;
+    }
+
     ecu.data.rpm = shared_rpm.load(Ordering::Relaxed);
 
+    // 1. If in Idle or SyncSent state, check single-byte handshake
+    if (ecu.state == EcuState::Idle || ecu.state == EcuState::SyncSent) && frame.len() == 1 {
+        let incoming_byte = frame[0];
+        let resp = ecu.process_byte(incoming_byte);
+        if !resp.is_empty() {
+            info!("⚡ [HANDSHAKE] RX 0x{:02X} -> TX {:02X?}", incoming_byte, resp);
+            echo_guard.record_tx(&resp);
+            if let Err(e) = serial_writer.write_all(&resp) {
+                error!("Serial write error: {}", e);
+            }
+            let _ = serial_writer.flush();
+            return;
+        }
+    }
+
+    // 2. Process ISO frame (Fast Init $81, Mode 01, Mode 03, Mode 04, Mode 09, etc.)
     if let Some(resp) = ecu.process_frame(frame) {
         log_diagnostic_exchange(frame, &resp, ecu.data.rpm);
         echo_guard.record_tx(&resp);
@@ -228,6 +237,8 @@ fn handle_frame(
             error!("Serial write error: {}", e);
         }
         let _ = serial_writer.flush();
+    } else {
+        warn!("⚠️ [UNHANDLED/NO RESPONSE] {} bytes: {:02X?}", frame.len(), frame);
     }
 }
 

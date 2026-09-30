@@ -107,7 +107,8 @@ impl EcuSimulator {
     pub fn process_byte(&mut self, byte: u8) -> Vec<u8> {
         match self.state {
             EcuState::Idle => {
-                if byte == self.address {
+                // Accept configured address, generic OBD2 (0x33), engine functional (0x11), or 5-baud break condition (0x00)
+                if byte == self.address || byte == 0x33 || byte == 0x11 || byte == 0x00 {
                     self.state = EcuState::SyncSent;
                     vec![0x55, self.kb1, self.kb2]
                 } else {
