@@ -167,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut car_led = CarLed::open(Some(args.car_led_line));
     let mut slow_init = SlowInitDetector::new();
     let mut wake_deadline: Option<TokioInstant> = None;
+    let mut pending_init_addr: Option<u8> = None;
     let mut kb2_deadline: Option<TokioInstant> = None;
     let mut last_session_state = ecu.state;
 
@@ -207,11 +208,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // 1. If in Idle state and incoming bytes are break pulses (0x00), track 5-baud wake
                     if ecu.state == EcuState::Idle && legitimate.iter().all(|&b| b == 0x00) {
-                        if let Some(target_time) = slow_init.push(Instant::now()) {
+                        if let Some((target_time, addr)) = slow_init.push(Instant::now()) {
                             let delay = target_time.saturating_duration_since(Instant::now());
                             wake_deadline = Some(TokioInstant::now() + delay);
+                            pending_init_addr = Some(addr);
                             info!(
-                                "⚡ [HANDSHAKE] Wake 5-baud pattern recognized (bursts de 0x00); scheduling 55 KB1 KB2 in {} ms",
+                                "⚡ [HANDSHAKE] Wake 5-baud pattern recognized (bursts de 0x00 para addr 0x{:02X}); scheduling 55 KB1 KB2 in {} ms",
+                                addr,
                                 delay.as_millis()
                             );
                         }
@@ -221,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(frame) = packetizer.push(&legitimate) {
                         // When a complete frame arrives, cancel any pending slow-init wake
                         wake_deadline = None;
+                        pending_init_addr = None;
                         slow_init.reset();
                         handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &mut car_led, &frame, &shared_rpm);
                         if ecu.state == EcuState::SessionActive {
@@ -233,8 +237,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = wake_fut => {
                 wake_deadline = None;
                 if ecu.state == EcuState::Idle {
+                    if let Some(addr) = pending_init_addr.take() {
+                        ecu.address = addr;
+                    }
                     let resp = vec![0x55, ecu.kb1, ecu.kb2];
-                    info!("⚡ [HANDSHAKE] Wake 5-baud -> TX {:02X?}", resp);
+                    info!("⚡ [HANDSHAKE] Wake 5-baud (addr 0x{:02X}) -> TX {:02X?}", ecu.address, resp);
                     echo_guard.record_tx(&resp);
                     car_led.pulse();
                     if let Err(e) = serial_writer.write_all(&resp) {
@@ -308,6 +315,7 @@ fn handle_frame(
             info!("⚡ [HANDSHAKE] RX 0x{:02X} -> TX {:02X?}", incoming_byte, resp);
             echo_guard.record_tx(&resp);
             car_led.pulse();
+            std::thread::sleep(Duration::from_millis(30)); // ISO W4 window: 25-50ms
             if let Err(e) = serial_writer.write_all(&resp) {
                 error!("Serial write error: {}", e);
             }

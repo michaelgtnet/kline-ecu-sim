@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 pub const MIN_GAP: Duration = Duration::from_millis(150);
 pub const MAX_GAP: Duration = Duration::from_millis(2500);
-pub const RESPONSE_DELAY: Duration = Duration::from_millis(780);
+pub const RESPONSE_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Default)]
 pub struct SlowInitDetector {
@@ -29,8 +29,9 @@ impl SlowInitDetector {
     }
 
     /// Record a received 0x00 break pulse in Idle state.
-    /// Returns the target Instant to transmit `[0x55, KB1, KB2]` once detected.
-    pub fn push(&mut self, now: Instant) -> Option<Instant> {
+    /// Returns the target Instant and target address byte (e.g. 0x33 or 0x01)
+    /// to transmit `[0x55, KB1, KB2]` once detected.
+    pub fn push(&mut self, now: Instant) -> Option<(Instant, u8)> {
         if let Some(&last) = self.pulses.last() {
             let gap = now.saturating_duration_since(last);
             if gap < MIN_GAP {
@@ -43,10 +44,10 @@ impl SlowInitDetector {
         self.pulses.push(now);
         self.pulses.retain(|t| now.saturating_duration_since(*t) <= MAX_GAP);
 
-        // When 3 pulses arrive (standard 5-baud sequence e.g. X100 H200 L400 H400 L400 H400)
+        // When 3 pulses arrive (standard 5-baud 0x33 sequence: Start, D2-D3, D6-D7)
         if self.pulses.len() >= 3 {
             self.pulses.clear();
-            return Some(now + RESPONSE_DELAY);
+            return Some((now + RESPONSE_DELAY, 0x33));
         }
 
         None
@@ -64,7 +65,7 @@ mod tests {
         assert_eq!(det.push(t0), None);
         assert_eq!(det.push(t0 + Duration::from_millis(800)), None);
         let fire = det.push(t0 + Duration::from_millis(1600));
-        assert_eq!(fire, Some(t0 + Duration::from_millis(1600) + RESPONSE_DELAY));
+        assert_eq!(fire, Some((t0 + Duration::from_millis(1600) + RESPONSE_DELAY, 0x33)));
     }
 
     #[test]
