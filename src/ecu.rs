@@ -107,8 +107,7 @@ impl EcuSimulator {
     pub fn process_byte(&mut self, byte: u8) -> Vec<u8> {
         match self.state {
             EcuState::Idle => {
-                // Accept configured address, generic OBD2 (0x33), engine functional (0x11), or 5-baud break condition (0x00)
-                if byte == self.address || byte == 0x33 || byte == 0x11 || byte == 0x00 {
+                if byte == self.address || (self.profile == EcuProfile::GenericObd && byte == 0x33) {
                     self.state = EcuState::SyncSent;
                     vec![0x55, self.kb1, self.kb2]
                 } else {
@@ -216,11 +215,14 @@ impl EcuSimulator {
         }
     }
 
-    fn check_fast_init(&self, frame: &[u8]) -> Option<Vec<u8>> {
+    fn check_fast_init(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
         // Fast init StartCommunication: [Format, Target, Source, 0x81, Checksum]
+        // E.g. ThinkDiag OBD2: [0xC1, 0x33, 0xF1, 0x81, 0x66]
         if frame.len() >= 4 && frame[frame.len() - 2] == 0x81 {
             let target = if frame.len() >= 5 { frame[1] } else { self.address };
-            if target == self.address || target == 0x33 || target == 0x11 {
+            let source = if frame.len() >= 5 { frame[2] } else { self.tester_addr };
+            if target == self.address || target == 0x33 || target == 0x11 || target == 0x01 {
+                self.tester_addr = source;
                 let mut resp = vec![0x83, self.tester_addr, self.ecu_addr, 0xC1, self.kb1, self.kb2];
                 resp.push(Self::calc_checksum(&resp));
                 return Some(resp);

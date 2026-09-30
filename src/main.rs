@@ -217,6 +217,10 @@ fn handle_frame(
     // 1. If in Idle or SyncSent state, check single-byte handshake
     if (ecu.state == EcuState::Idle || ecu.state == EcuState::SyncSent) && frame.len() == 1 {
         let incoming_byte = frame[0];
+        // In Idle state, ignore 0x00 break pulse (it's the 25ms Fast Init wake pulse!)
+        if ecu.state == EcuState::Idle && incoming_byte == 0x00 {
+            return;
+        }
         let resp = ecu.process_byte(incoming_byte);
         if !resp.is_empty() {
             info!("⚡ [HANDSHAKE] RX 0x{:02X} -> TX {:02X?}", incoming_byte, resp);
@@ -237,7 +241,7 @@ fn handle_frame(
             error!("Serial write error: {}", e);
         }
         let _ = serial_writer.flush();
-    } else {
+    } else if frame != [0x00] {
         warn!("⚠️ [UNHANDLED/NO RESPONSE] {} bytes: {:02X?}", frame.len(), frame);
     }
 }
