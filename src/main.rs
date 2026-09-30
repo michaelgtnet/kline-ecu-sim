@@ -3,16 +3,17 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use kline_ecu_sim::{
     EchoGuard, EcuProfile, EcuSimulator, EcuState, NativeSerialPort, SilencePacketizer,
+    SlowInitDetector,
 };
 
 #[derive(Parser, Debug)]
@@ -159,6 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut packetizer = SilencePacketizer::new(args.baud, 15.0);
     let mut echo_guard = EchoGuard::new(args.baud);
+    let mut slow_init = SlowInitDetector::new();
+    let mut wake_deadline: Option<TokioInstant> = None;
+    let mut kb2_deadline: Option<TokioInstant> = None;
     let mut last_session_state = ecu.state;
 
     // 4. Main Event Loop
@@ -172,20 +176,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        let wd = wake_deadline;
+        let wake_fut = async move {
+            match wd {
+                Some(deadline) => sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        let kd = kb2_deadline;
+        let kb2_fut = async move {
+            match kd {
+                Some(deadline) => sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             Some(raw_bytes) = rx.recv() => {
                 let legitimate = echo_guard.filter_rx(&raw_bytes);
                 if !legitimate.is_empty() {
                     info!("📥 [BUS RX] {} bytes: {:02X?}", legitimate.len(), legitimate);
-                    if let Some(frame) = packetizer.push(&legitimate) {
-                        handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &frame, &shared_rpm);
+
+                    // 1. If in Idle state and incoming bytes are break pulses (0x00), track 5-baud wake
+                    if ecu.state == EcuState::Idle && legitimate.iter().all(|&b| b == 0x00) {
+                        if let Some(target_time) = slow_init.push(Instant::now()) {
+                            let delay = target_time.saturating_duration_since(Instant::now());
+                            wake_deadline = Some(TokioInstant::now() + delay);
+                            info!(
+                                "⚡ [HANDSHAKE] Wake 5-baud pattern recognized (bursts de 0x00); scheduling 55 KB1 KB2 in {} ms",
+                                delay.as_millis()
+                            );
+                        }
                     }
+
+                    // 2. ALWAYS pass incoming bytes to packetizer (handles Fast Init [C1, 33, F1, 81, 66] and active session commands)
+                    if let Some(frame) = packetizer.push(&legitimate) {
+                        // When a complete frame arrives, cancel any pending slow-init wake
+                        wake_deadline = None;
+                        slow_init.reset();
+                        handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &frame, &shared_rpm);
+                        if ecu.state == EcuState::SessionActive {
+                            kb2_deadline = None;
+                        }
+                    }
+                }
+            }
+
+            _ = wake_fut => {
+                wake_deadline = None;
+                if ecu.state == EcuState::Idle {
+                    let resp = vec![0x55, ecu.kb1, ecu.kb2];
+                    info!("⚡ [HANDSHAKE] Wake 5-baud -> TX {:02X?}", resp);
+                    echo_guard.record_tx(&resp);
+                    if let Err(e) = serial_writer.write_all(&resp) {
+                        error!("Serial write error: {}", e);
+                    }
+                    let _ = serial_writer.flush();
+                    ecu.state = EcuState::SyncSent;
+                    kb2_deadline = Some(TokioInstant::now() + Duration::from_millis(800));
+                }
+            }
+
+            _ = kb2_fut => {
+                kb2_deadline = None;
+                if ecu.state == EcuState::SyncSent {
+                    warn!("⚠️ [HANDSHAKE] Scanner did not respond with ~KB2 in 800ms; returning to Idle");
+                    ecu.state = EcuState::Idle;
+                    slow_init.reset();
                 }
             }
 
             _ = timeout_fut => {
                 if let Some(frame) = packetizer.check_timeout() {
                     handle_frame(&mut ecu, &mut serial_writer, &mut echo_guard, &frame, &shared_rpm);
+                    if ecu.state == EcuState::SessionActive {
+                        kb2_deadline = None;
+                    }
                 }
             }
         }
@@ -193,8 +260,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if ecu.state != last_session_state {
             if ecu.state == EcuState::SessionActive {
                 info!("✅ [SESSION ACTIVE] Diagnostic session fully opened with scanner!");
+                wake_deadline = None;
+                kb2_deadline = None;
+                slow_init.reset();
             } else if ecu.state == EcuState::Idle {
                 warn!("⚠️ [SESSION RESET] Session reset to Idle.");
+                wake_deadline = None;
+                kb2_deadline = None;
+                slow_init.reset();
             }
             last_session_state = ecu.state;
         }
