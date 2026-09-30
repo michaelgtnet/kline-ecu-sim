@@ -162,7 +162,24 @@ impl EcuSimulator {
                     return Some(resp);
                 }
             }
-            return None;
+            // AUTO-RECOVERY: If the scanner is already in an active session sending valid frames
+            // (e.g. TesterPresent $3E, Mode 01, StartDiagnosticSession $10, etc.),
+            // verify checksum and if addressed to this ECU, wake up into SessionActive!
+            if frame.len() >= 2 {
+                let expected_csum = Self::calc_checksum(&frame[..frame.len() - 1]);
+                if expected_csum == frame[frame.len() - 1] {
+                    if let Some((_service, _)) = self.parse_iso_service(frame) {
+                        self.state = EcuState::SessionActive;
+                        // Fall through to active session processing below!
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
         }
 
         // 2. If in SyncSent state and a single byte arrived (~KB2)
@@ -191,9 +208,7 @@ impl EcuSimulator {
 
         match service {
             // Mode 01: Show Current Data (Live Data)
-            0x01 => {
-                Some(self.handle_mode_01(sub_payload))
-            }
+            0x01 => Some(self.handle_mode_01(sub_payload)),
             // Mode 02: Freeze Frame Data
             0x02 => {
                 let pid = sub_payload.first().copied().unwrap_or(0x02);
@@ -208,11 +223,51 @@ impl EcuSimulator {
             }
             // Mode 07: Show Pending DTCs
             0x07 => Some(self.wrap_iso_response(0x47, &[0x00])),
-            // Mode 09: Vehicle Information (VIN, Calibration ID)
+            // Mode 0A: Show Permanent DTCs
+            0x0A => Some(self.wrap_iso_response(0x4A, &[0x00])),
+            // Mode 09: Vehicle Information (VIN, Calibration ID, CVN, ECU Name)
             0x09 => {
                 let pid = sub_payload.first().copied().unwrap_or(0x02);
                 Some(self.handle_mode_09(pid))
             }
+            // Service 0x10: StartDiagnosticSession (KWP2000 standard/programming/development)
+            0x10 => {
+                let sub = sub_payload.first().copied().unwrap_or(0x81);
+                Some(self.wrap_iso_response(0x50, &[sub]))
+            }
+            // Service 0x14: ClearDiagnosticInformation (KWP2000)
+            0x14 => {
+                self.data.dtcs.clear();
+                Some(self.wrap_iso_response(0x54, &[]))
+            }
+            // Service 0x18: ReadDiagnosticTroubleCodesByStatus (KWP2000)
+            0x18 => Some(self.handle_kwp_read_dtcs()),
+            // Service 0x21: ReadDataByLocalIdentifier (VAG Measuring Blocks / Groups)
+            0x21 => {
+                let group = sub_payload.first().copied().unwrap_or(0x01);
+                Some(self.handle_kwp_measuring_block(group))
+            }
+            // Service 0x22: ReadDataByIdentifier (KWP2000 / UDS)
+            0x22 => Some(self.handle_kwp_read_by_id(sub_payload)),
+            // Service 0x27: SecurityAccess (ME7.5 Flashing Backtest: Seed/Key)
+            0x27 => {
+                let sub = sub_payload.first().copied().unwrap_or(0x01);
+                Some(self.handle_kwp_security_access(sub, sub_payload))
+            }
+            // Service 0x31: RoutineControl (Erase Flash Sector, Checksum Verify)
+            0x31 => {
+                let routine = sub_payload.first().copied().unwrap_or(0x01);
+                Some(self.wrap_iso_response(0x71, &[routine]))
+            }
+            // Service 0x34: RequestDownload (Flash Download Request)
+            0x34 => Some(self.wrap_iso_response(0x74, &[])),
+            // Service 0x36: TransferData (Flash Data Block Transfer)
+            0x36 => {
+                let block_seq = sub_payload.first().copied().unwrap_or(0x01);
+                Some(self.wrap_iso_response(0x76, &[block_seq]))
+            }
+            // Service 0x37: RequestTransferExit (Flash Transfer Complete)
+            0x37 => Some(self.wrap_iso_response(0x77, &[])),
             // TesterPresent ($3E)
             0x3E => {
                 let sub = sub_payload.first().copied().unwrap_or(0x01);
@@ -317,9 +372,9 @@ impl EcuSimulator {
         for &pid in requested_pids {
             match pid {
                 // PID 00: Supported PIDs [01-20]
-                // Supported: 01, 02, 03, 04, 05, 06, 07, 0B, 0C, 0D, 0E, 0F, 10, 11, 12, 13, 14, 15, 1C, 1F
+                // Supported: 01, 02, 03, 04, 05, 06, 07, 0B, 0C, 0D, 0E, 0F, 10, 11, 12, 13, 14, 15, 1C, 1F, 20
                 0x00 => {
-                    payload.extend_from_slice(&[0x00, 0xFE, 0x3F, 0xF8, 0x12]);
+                    payload.extend_from_slice(&[0x00, 0xFE, 0x3F, 0xF8, 0x13]);
                 }
                 // PID 01: Monitor Status Since DTCs Cleared
                 0x01 => {
@@ -407,11 +462,63 @@ impl EcuSimulator {
                 0x1F => {
                     payload.extend_from_slice(&[0x1F, 0x01, 0xC2]);
                 }
+                // PID 20: Supported PIDs [21-40] (Supports 21, 2E, 2F, 30, 31, 33, 40)
+                0x20 => {
+                    payload.extend_from_slice(&[0x20, 0x80, 0x07, 0xA0, 0x01]);
+                }
+                // PID 21: Distance Traveled with MIL On (42 km)
+                0x21 => {
+                    payload.extend_from_slice(&[0x21, 0x00, 42]);
+                }
+                // PID 2E: Commanded Evaporative Purge (12%)
+                0x2E => {
+                    payload.extend_from_slice(&[0x2E, 31]);
+                }
+                // PID 2F: Fuel Tank Level Input (65%)
+                0x2F => {
+                    payload.extend_from_slice(&[0x2F, 166]);
+                }
+                // PID 30: Warm-ups Since Codes Cleared
+                0x30 => {
+                    payload.extend_from_slice(&[0x30, 15]);
+                }
+                // PID 31: Distance Traveled Since Codes Cleared (120 km)
+                0x31 => {
+                    payload.extend_from_slice(&[0x31, 0x00, 120]);
+                }
+                // PID 33: Absolute Barometric Pressure (101 kPa)
+                0x33 => {
+                    payload.extend_from_slice(&[0x33, 101]);
+                }
+                // PID 40: Supported PIDs [41-60] (Supports 42, 45, 46, 49, 4A, 4C)
+                0x40 => {
+                    payload.extend_from_slice(&[0x40, 0x74, 0x00, 0x00, 0x00]);
+                }
                 // PID 42: Control Module Voltage: V = ((A*256)+B)/1000
                 0x42 => {
                     let a = (self.data.battery_mv >> 8) as u8;
                     let b = (self.data.battery_mv & 0xFF) as u8;
                     payload.extend_from_slice(&[0x42, a, b]);
+                }
+                // PID 45: Relative Throttle Position (12%)
+                0x45 => {
+                    payload.extend_from_slice(&[0x45, 31]);
+                }
+                // PID 46: Ambient Air Temperature (25°C = 65)
+                0x46 => {
+                    payload.extend_from_slice(&[0x46, 65]);
+                }
+                // PID 49: Accelerator Pedal Position D (15%)
+                0x49 => {
+                    payload.extend_from_slice(&[0x49, 38]);
+                }
+                // PID 4A: Accelerator Pedal Position E (15%)
+                0x4A => {
+                    payload.extend_from_slice(&[0x4A, 38]);
+                }
+                // PID 4C: Commanded Throttle Actuator (15%)
+                0x4C => {
+                    payload.extend_from_slice(&[0x4C, 38]);
                 }
                 _ => {}
             }
@@ -437,8 +544,8 @@ impl EcuSimulator {
 
     fn handle_mode_09(&self, pid: u8) -> Vec<u8> {
         match pid {
-            // PID 00: Supported Mode 09 PIDs [01-20] (PID 02 is bit 6 of Byte A: 0x40; PID 04 is bit 4: 0x10)
-            0x00 => self.wrap_iso_response(0x49, &[0x00, 0x50, 0x00, 0x00, 0x00]),
+            // PID 00: Supported Mode 09 PIDs [01-20] (PID 02, 04, 06, 0A)
+            0x00 => self.wrap_iso_response(0x49, &[0x00, 0x54, 0x40, 0x00, 0x00]),
             // PID 02: VIN
             0x02 => {
                 let mut payload = vec![0x02, 0x01]; // PID 02, 1 message
@@ -451,7 +558,80 @@ impl EcuSimulator {
                 payload.extend_from_slice(b"06A906032HP     ");
                 self.wrap_iso_response(0x49, &payload)
             }
+            // PID 06: CVN (Calibration Verification Number)
+            0x06 => {
+                let payload = vec![0x06, 0x01, 0xA1, 0xB2, 0xC3, 0xD4];
+                self.wrap_iso_response(0x49, &payload)
+            }
+            // PID 0A: ECU Name
+            0x0A => {
+                let mut payload = vec![0x0A, 0x01];
+                let mut name = b"BOSCH ME7.5 ECM     ".to_vec();
+                name.truncate(20);
+                payload.extend_from_slice(&name);
+                self.wrap_iso_response(0x49, &payload)
+            }
             _ => self.wrap_iso_response(0x7F, &[0x09, 0x12]),
+        }
+    }
+
+    fn handle_kwp_read_dtcs(&self) -> Vec<u8> {
+        let mut payload = vec![self.data.dtcs.len() as u8];
+        for dtc in &self.data.dtcs {
+            payload.push(dtc[0]);
+            payload.push(dtc[1]);
+            payload.push(0x21); // Status byte (Current / MIL illuminated)
+        }
+        self.wrap_iso_response(0x58, &payload)
+    }
+
+    fn handle_kwp_measuring_block(&self, group: u8) -> Vec<u8> {
+        let mut payload = vec![group];
+        match group {
+            // Group 001: Basic Engine Data [RPM, Coolant Temp, Lambda Control, Basic Settings]
+            0x01 => {
+                let raw_rpm = self.data.rpm / 40;
+                let raw_temp = (self.data.coolant_temp_c + 48).clamp(0, 255) as u8;
+                payload.extend_from_slice(&[raw_rpm as u8, raw_temp, 0x80, 0x00]);
+            }
+            // Group 002: Load / MAF / Injection Time
+            0x02 => {
+                let raw_rpm = (self.data.rpm / 40) as u8;
+                payload.extend_from_slice(&[raw_rpm, 0x28, 0x18, 0x22]);
+            }
+            // Group 003: RPM / MAF / Throttle Angle / Timing
+            0x03 => {
+                let raw_rpm = (self.data.rpm / 40) as u8;
+                payload.extend_from_slice(&[raw_rpm, 0x20, 0x15, 0x90]);
+            }
+            _ => {
+                payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            }
+        }
+        self.wrap_iso_response(0x61, &payload)
+    }
+
+    fn handle_kwp_read_by_id(&self, sub: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(sub);
+        payload.extend_from_slice(b"06A906032HP 1.8L R4/5VT     ");
+        self.wrap_iso_response(0x62, &payload)
+    }
+
+    fn handle_kwp_security_access(&self, sub: u8, sub_payload: &[u8]) -> Vec<u8> {
+        match sub {
+            // 0x01: Request Seed (returns 4-byte seed)
+            0x01 => {
+                self.wrap_iso_response(0x67, &[0x01, 0x34, 0x78, 0x12, 0x56])
+            }
+            // 0x02: Send Key (grant access for backtesting)
+            0x02 => {
+                self.wrap_iso_response(0x67, &[0x02])
+            }
+            _ => {
+                let p = if sub_payload.is_empty() { &[0x01][..] } else { sub_payload };
+                self.wrap_iso_response(0x67, p)
+            }
         }
     }
 
@@ -541,5 +721,71 @@ mod tests {
 
         let resp_after = sim.process_frame(&req_dtc).unwrap();
         assert_eq!(resp_after[4], 0); // 0 DTCs!
+    }
+
+    #[test]
+    fn test_auto_recovery_from_idle_on_tester_present() {
+        let mut sim = EcuSimulator::new(EcuProfile::BoschMe75);
+        assert_eq!(sim.state, EcuState::Idle);
+
+        // Frame from ThinkDiag: [C2, 33, F1, 3E, 01, 25]
+        let req = vec![0xC2, 0x33, 0xF1, 0x3E, 0x01, 0x25];
+        let resp = sim.process_frame(&req).expect("Expected auto-recovery and response");
+
+        assert_eq!(sim.state, EcuState::SessionActive);
+        // Expect positive response to TesterPresent: service 0x7E, sub 0x01
+        assert_eq!(resp[3], 0x7E);
+        assert_eq!(resp[4], 0x01);
+    }
+
+    #[test]
+    fn test_mode_01_extended_pids() {
+        let mut sim = EcuSimulator::new(EcuProfile::BoschMe75);
+        sim.state = EcuState::SessionActive;
+
+        // Query PID 00 (Supported PIDs)
+        let mut req_pid00 = vec![0x68, 0x6A, 0xF1, 0x01, 0x00];
+        req_pid00.push(EcuSimulator::calc_checksum(&req_pid00));
+        let resp00 = sim.process_frame(&req_pid00).unwrap();
+        assert_eq!(resp00[3], 0x41);
+        assert_eq!(resp00[4], 0x00);
+        assert_eq!(resp00[8] & 0x01, 0x01); // PID 20 supported
+
+        // Query PID 42 (Module Voltage)
+        let mut req_pid42 = vec![0x68, 0x6A, 0xF1, 0x01, 0x42];
+        req_pid42.push(EcuSimulator::calc_checksum(&req_pid42));
+        let resp42 = sim.process_frame(&req_pid42).unwrap();
+        assert_eq!(resp42[3], 0x41);
+        assert_eq!(resp42[4], 0x42);
+        let voltage_mv = ((resp42[5] as u16) << 8) | (resp42[6] as u16);
+        assert_eq!(voltage_mv, 13800); // 13.8V
+    }
+
+    #[test]
+    fn test_kwp2000_programming_and_security_access() {
+        let mut sim = EcuSimulator::new(EcuProfile::BoschMe75);
+        sim.state = EcuState::SessionActive;
+
+        // 1. Start Diagnostic Session (Programming: 0x10 0x85)
+        let mut req_prog = vec![0xC2, 0x33, 0xF1, 0x10, 0x85];
+        req_prog.push(EcuSimulator::calc_checksum(&req_prog));
+        let resp_prog = sim.process_frame(&req_prog).unwrap();
+        assert_eq!(resp_prog[3], 0x50);
+        assert_eq!(resp_prog[4], 0x85);
+
+        // 2. Request Seed (0x27 0x01)
+        let mut req_seed = vec![0xC2, 0x33, 0xF1, 0x27, 0x01];
+        req_seed.push(EcuSimulator::calc_checksum(&req_seed));
+        let resp_seed = sim.process_frame(&req_seed).unwrap();
+        assert_eq!(resp_seed[3], 0x67);
+        assert_eq!(resp_seed[4], 0x01);
+        assert_eq!(resp_seed.len(), 10); // fmt, target, src, 67, 01, s1, s2, s3, s4, cs
+
+        // 3. Send Key (0x27 0x02)
+        let mut req_key = vec![0xC6, 0x33, 0xF1, 0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD];
+        req_key.push(EcuSimulator::calc_checksum(&req_key));
+        let resp_key = sim.process_frame(&req_key).unwrap();
+        assert_eq!(resp_key[3], 0x67);
+        assert_eq!(resp_key[4], 0x02); // Granted!
     }
 }
